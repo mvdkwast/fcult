@@ -1,0 +1,448 @@
+#!/usr/bin/perl
+
+# Télécharger des émissions en mp3 de France Culture 
+# (http://www.franceculture.fr)
+#
+# Copyright (c) Martijn van der Kwast 2013 <martijn@vdkwast.com>
+# Ce programme peut-être distribué selon les conditions de la license
+# artistique perl (http://dev.perl.org/licenses/artistic.html)
+
+use v5.10;
+use strict;
+use utf8::all;
+
+use LWP::Simple;
+use URI::Escape;
+use HTML::Entities;
+use File::Spec::Functions qw/catfile/;
+use Storable;
+
+binmode STDOUT, ':utf8';
+
+use constant CONFIG_PATH => catfile($ENV{HOME}, '.fcult');
+use constant FN_PROGRAMMES => catfile(CONFIG_PATH, 'programmes.store');
+use constant FN_LIENS_PROGRAMMES => catfile(CONFIG_PATH, 'liens_programmes.store');
+
+################################################################################
+# Non-specific functions
+################################################################################
+
+# Exit codes
+# EXIT_OK
+#     Doesn't really need an explanation, does it ?
+# EXIT_USAGE  
+#     Command-line syntax not understood
+# EXIT_VALUE
+#     Invalid values provided by user, like a reference to a non-existing index
+#     on the command-line.  
+# EXIT_NOINPUT
+#     Local resource not found
+# EXIT_CANTCREAT
+#     Cannot create a local file. This includes permission issues.
+# EXIT_NOCONN
+#     Connection problems. Could not access remote documents. This covers local
+#     and remote connection issues.  
+# EXIT_PROTOCOL
+#     Remote side returned unexpected data.
+use constant EXIT_OK => 0;
+use constant EXIT_USAGE => 64;
+use constant EXIT_VALUE => 65;
+use constant EXIT_NOINPUT => 66;
+use constant EXIT_CANTCREAT => 73;
+use constant EXIT_NOCONN => 75;
+use constant EXIT_PROTOCOL => 76;
+
+# Fail with error code and error message
+sub fail {
+    my ($code, $msg) = @_;
+    say STDERR $msg;
+    exit $code;
+}
+
+# return file contents, dieing on failure
+sub read_file {
+    my $fn = shift;
+    local $/=undef;
+    open my $f, '<', $fn or fail EXIT_NOINPUT, "Could not open $fn";
+    my $data = <$f>;
+    return $data;
+}
+
+# replace invalid characters in filename with a dash ('-')
+sub sanitize_filename {
+    my $fn = shift;
+    $fn =~ s{[<>:"/\\|?*]}{-}g;
+    return $fn;
+}
+
+################################################################################
+# Script functions
+################################################################################
+
+# globals
+my @noms_programmes;
+my @liens_programmes;
+
+# Enlève les espaces et tirets superflus
+sub clean_name {
+    my $n = shift;
+    $n =~ s/^\s*//;
+    $n =~ s/\s*$//;
+    $n =~ s/\s*-\s*$//;
+    $n =~ s/\s+/ /g;
+    return $n;
+}
+
+# transforme dd.mm.yyyy en yyyy-mm-dd afin de pouvoir trier les dates 
+# alphabétiquement
+sub reformat_date {
+    my $d = shift;
+    return substr($d, 6, 4) . '-' . substr($d, 3, 2) . '-' . substr($d, 0, 2);
+}
+
+# transforme le nom d'un programme en nom du fichier qui contiendra la liste
+# des émissions.
+sub fn_programme {
+    my $idx = shift;
+    return catfile(CONFIG_PATH, sanitize_filename($noms_programmes[$idx]) . '.store');
+}
+
+# Charge la liste des programmes connus dans les variables globales
+sub load_programmes {
+    fail EXIT_NOINPUT, FN_PROGRAMMES . " not found, run update first" 
+        unless -f FN_PROGRAMMES;
+    @noms_programmes = @{retrieve FN_PROGRAMMES};
+    @liens_programmes = @{retrieve FN_LIENS_PROGRAMMES};
+}
+
+# Télécharger le flux d'une émission en mp3.
+# A partir de l'adresse d'une émission (/emission-xxx-xxx-xxx-date) trouve 
+# l'url du stream en scrapant la page de l'émission pour trouver la page
+# du lecteur, puis la page du lecteur pour trouver le lien vers le fichier
+# mp3.
+sub get_emission {
+    my ($given_url, $fn) = @_;
+
+    # 1. trouver la page de l'emission
+    my $start_url = q{http://www.franceculture.fr} . $given_url;
+    my $page_emission = get($start_url) 
+        or fail EXIT_NOCONN, "Page de l'emission non trouvée ou non joignable";
+
+    # 2. trouver la page du player 
+    $page_emission =~ m{(/player/reecouter\?play=\d+)}
+        or fail EXIT_PROTOCOL, "Adresse du lecteur non trouvée dans la page de l'émission";
+    my $player_url = q{http://www.franceculture.fr} . $1;
+
+    my $page_player = get($player_url)
+        or fail EXIT_NOCONN, "Page du lecteur non trouvée ou non joignable ($player_url)";
+
+    # 3. identifier le lien mp3 dans la page du player
+    my $mp3_prefix = q{http://www.franceculture.fr/};
+    $page_player =~ m{urlAOD=(.*?)&}
+        or fail EXIT_PROTOCOL, "Adresse du flux mp3 non trouvée dans la page du lecteur";
+    my $mp3_url = $mp3_prefix . uri_unescape($1);
+
+    # 4. telecharger mp3
+    say "Téléchargement de $mp3_url";
+    my $rc = getstore($mp3_url, $fn);
+    fail EXIT_NOCONN, "Le flux mp3 n'a pas pu être téléchargé"
+        unless $rc == 200;
+
+    say "Ok.";
+}
+
+# a partir de la premiere page d'un programme recuperer l'url de toutes 
+# les pages suivantes.
+sub get_next_pages_links {
+    my $page = shift;
+    my @pages = $page =~ m{<span class='pager-item'><a href="([^"]+)"}g;
+    return @pages;
+}
+
+# recuperer les url de toutes les emissions sur la page d'un programme
+sub get_emissions_links_in_page { 
+    my $page = shift;
+    my @emissions;
+
+    while ($page =~ m{
+            <div\ id="node-\d+"\ class="node\ node-rf_diffusion"
+            .*?
+            <a\ href
+            .*?
+            <span\ class="timer-liste">(\d{2}.\d{2}.\d{4})
+            .*?
+            <a\ href="([^"]+)"\ title="([^"]+)"
+        }sgx)
+    {
+        push @emissions, [ $1, $2, decode_entities($3) ];
+    }
+
+    return @emissions;
+}
+
+# recuperer les liens de toutes les emissions en itérant sur toutes les 
+# page d'un programme, en utilisant la première page de celui-ci.
+sub get_all_emissions_links {
+    my $page = shift;
+    my @page_urls = get_next_pages_links $page;
+
+    my @emissions = get_emissions_links_in_page $page;
+
+    for my $page_url (@page_urls) {
+        my $data = get q{http://www.franceculture.fr} . $page_url;
+        push @emissions, get_emissions_links_in_page $data;
+    }
+
+    return @emissions;
+}
+
+# Trouve toutes les émissions d'un programme et les stocke
+# Si l'url de l'émission finit en -\d+, cherche les autres pages possible en
+# consultant les autres numéros et la page sans numéro.
+sub update_emissions {
+    my $idx = shift;
+    my @emissions;
+
+    my $root_url = $liens_programmes[$idx];
+    say "Récupération des émissions sur $root_url";
+    my $page = get q{http://www.franceculture.fr} . $root_url
+        or fail EXIT_NOCONN, "Page de l'émission indisponible";
+
+    @emissions = get_all_emissions_links $page;
+
+    if ($root_url =~ m{-(\d+)$}) {
+        for my $i (0 .. $1-1) {
+            my $older_url = $root_url =~ s{-\d+$}{-$i}r;
+            say "Récupération des émissions sur $older_url";
+            my $older_page = get q{http://www.franceculture.fr} . $older_url;
+            push @emissions, get_all_emissions_links $older_page;
+        }
+
+        {
+            my $older_url = $root_url =~ s{-\d+}{}r;
+            say "Récupération des émissions sur $older_url";
+            my $older_page = get q{http://www.franceculture.fr} . $older_url;
+            push @emissions, get_all_emissions_links $older_page;
+        }
+    }
+
+    my %emissions;
+    $emissions{$_->[1]} = $_ for @emissions;
+
+    sub dtfmt {
+        my $d = shift;
+        return substr($d, 6, 4) . substr($d, 3, 2) . substr($d, 0, 2);
+    }
+    @emissions = sort { dtfmt($a->[0]) <=> dtfmt($b->[0])} values %emissions;
+
+    store \@emissions, fn_programme($idx);
+}
+
+################################################################################
+# Commandes utilisateur
+################################################################################
+
+# Mettre en cache les émissions d'un programme identifié par son numéro.
+sub cmd_update_emissions {
+    my $idx = shift @ARGV;
+    fail EXIT_USAGE, "L'index du programme doit être un nombre"
+        unless defined $idx and $idx =~ m/\d+/;
+
+    load_programmes;
+
+    fail EXIT_VALUE, "Index de programme invalide"
+        unless $idx < @noms_programmes;
+
+    say "Mise à jour des émissions de " . $noms_programmes[$idx];
+
+    update_emissions $idx;
+
+    say "Fait!";
+}
+
+# Mettre en cache la liste des programmes.
+sub cmd_update_programmes {
+    say "Mise à jour de la liste de programmes";
+
+    my $page = get 'http://www.franceculture.fr/emissions/titre' 
+        or fail EXIT_NOCONN, "Liste indisponible";
+
+    while ($page =~ m{<a href="(/emission-[^"]+)">([^<]+)</a>}g) {
+        push @liens_programmes, $1;
+        push @noms_programmes, decode_entities($2);
+    }
+
+    store \@noms_programmes, FN_PROGRAMMES;
+    store \@liens_programmes, FN_LIENS_PROGRAMMES;
+
+    say "Fait!";
+}
+
+# Wrapper pour mettre à jour soit la liste des programmes, soit les émissions
+# d'un programme en fonction de la présence d'un argument de ligne de commande.
+sub cmd_update {
+    if (@ARGV) {
+        cmd_update_emissions;
+    }
+    else {
+        cmd_update_programmes;
+    }
+}
+
+# Afficher les émissions d'un programme
+sub cmd_list_emissions {
+    my $idx = shift @ARGV;
+    fail EXIT_USAGE, "L'index du programme doit être un nombre"
+        unless defined $idx and $idx =~ m/\d+/;
+
+    load_programmes;
+
+    fail EXIT_VALUE, "Index de programme invalide"
+        unless $idx < @noms_programmes;
+
+    unless (-f fn_programme($idx)) {
+        say "Programme non trouvé en cache.";
+        update_emissions $idx;
+    }
+
+    say "Affichage des emissions de " . fn_programme($idx);
+
+    my @emissions = @{retrieve fn_programme($idx)};
+    for my $i (0 .. $#emissions) {
+        printf "%03i. %s %s\n", $i, reformat_date($emissions[$i][0]), clean_name($emissions[$i][2]);
+    }
+}
+
+# Affiche la liste des programmes
+sub cmd_list_programmes {
+    load_programmes;
+
+    for my $i (0 .. $#liens_programmes) {
+        printf "%03i %s\n", $i, clean_name($noms_programmes[$i]);
+    }
+}
+
+# Wrapper pour afficher soit la liste des programmes, soit les émissions d'un
+# programme selon la présence d'un argument de ligne de commande.
+sub cmd_list {
+    if (@ARGV) {
+        cmd_list_emissions;
+    }
+    else {
+        cmd_list_programmes;
+    }
+}
+
+# Télécharger les émissions d'un programme en mp3.
+sub cmd_get {
+    fail EXIT_USAGE, "get <num_programme> <num_episode> {num_episode ...}" 
+        if @ARGV < 2;
+
+    my $prog = shift @ARGV;
+    fail EXIT_USAGE, "num_programme ($prog) doit être un nombre."
+        unless $prog =~ m{\d+};
+
+    load_programmes;
+
+    fail EXIT_NOINPUT, "Le listing de ce programme n'est pas en cache. Utilisez la commande 'update' avant 'get'"
+        unless -f fn_programme($prog);
+
+    fail EXIT_VALUE, "num_programme invalide ($prog)"
+        unless $prog < @noms_programmes;
+
+    my @emissions = @{retrieve fn_programme($prog)};
+
+    my @to_retrieve = ();
+    my $probs = 0;
+
+    while (defined (my $idx = shift @ARGV)) {
+        unless ($idx =~ m{\d+}) {
+            say "L'index de l'émission doit être un nombre (reçu: $idx)";
+            $probs++;
+        }
+
+        if ($idx >= @emissions) {
+            say "L'index de l'émission dépasse le nombre d'émissions (reçu: $idx)";
+            $probs++;
+        }
+
+        push @to_retrieve, $emissions[$idx];
+    }
+
+    exit if $probs;
+
+    say "A télécharger:";
+    for my $e (@to_retrieve) {
+        my $name = clean_name($e->[2]);
+        my $d = reformat_date($e->[0]);
+        say " - $d: $e->[1]\n      $name";
+    }
+
+    say "\nEntrée pour continuer, ^C pour avorter";
+    my $ok = <>;
+
+    for my $e (@to_retrieve) {
+        my $name = clean_name($e->[2]);
+        my $d = reformat_date($e->[0]);
+        say "$d: $name";
+
+        my $fn = sanitize_filename(
+            clean_name($noms_programmes[$prog]) 
+            . ' - ' 
+            . $d 
+            . ' - ' 
+            . $name 
+            . '.mp3'
+        );
+
+        get_emission $e->[1], $fn;
+    }
+
+    say "Ça c'est fait!";
+}
+
+sub cmd_help {
+    print <<TXT;
+Télécharger des émissions des archives de France Culture.
+Commandes disponibles:
+  update
+      Mettre à jour la liste des programmes. À lancer à la première 
+      utilisation.
+  update <num_programme>
+      Mettre à jour la liste des émissions d'un programme.
+  list
+      Afficher tous les programmes.
+  list <num_programme>
+      Afficher toutes les émissions d'un programme.
+  get <num_programme> {num_emission, num_emission2, ...}
+      Télécharger des émissions choisies d'un programme en mp3.
+  help
+      Afficher cette aide.
+TXT
+}
+
+my %commands = (
+    update => \&cmd_update,
+    list => \&cmd_list,
+    get => \&cmd_get,
+    help => \&cmd_help,
+);
+
+################################################################################
+# START
+################################################################################
+
+my $cmd_name = shift @ARGV;
+$cmd_name //= 'help';
+
+fail EXIT_USAGE, "Commande inconnue"
+    unless exists $commands{$cmd_name};
+
+unless (-d CONFIG_PATH) {
+    mkdir CONFIG_PATH
+        or fail EXIT_CANTCREAT, "Le répertoire de configuration n'a pas pu être créé\n(" . CONFIG_PATH . ")";
+}
+
+$commands{$cmd_name}->();
+
+exit EXIT_OK;
